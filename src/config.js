@@ -1,6 +1,8 @@
 export const MAX_QUEUED_PER_PERSON = 3;
-export const SKIP_VOTES = 3;
-export const SKIP_VOTES_WITH_REQUESTER = 2;
+// Optional env override (e.g. SKIP_VOTES=1 while testing alone). Default 3, or 2 with the requester.
+const skipEnv = Number.parseInt(process.env.SKIP_VOTES, 10);
+export const SKIP_VOTES = skipEnv >= 1 ? skipEnv : 3;
+export const SKIP_VOTES_WITH_REQUESTER = Math.min(2, SKIP_VOTES);
 export const TICK_MS = 3000;
 export const START_GRACE_MS = 5000;
 export const LOOKAHEAD_MS = 3500;
