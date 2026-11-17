@@ -7,6 +7,25 @@ and the speaker iPhone.
 Pick the office passcode now: at least 8 characters. Colleagues type it once
 per browser.
 
+## Test on your own PC first (no Railway, about 10 minutes)
+
+Use this to try Our FM yourself before it goes to the office. Only your PC can open it.
+
+1. **Spotify app.** Do step 2 below, but use this Redirect URI instead:
+   `http://127.0.0.1:3000/auth/callback`
+2. **Settings.** Open the `.env` file in the project folder (copy `.env.example` to `.env` if it
+   is missing). Paste your **Client ID** and **Client secret**, and set `OFFICE_PASSCODE` to
+   at least 8 characters. Leave `SPOTIFY_REDIRECT_URI` as it is. Never commit `.env`.
+3. **Start.** In the project folder run `npm install` once, then `npm run dev`.
+   Leave that window open; closing it stops Our FM.
+4. **Play device.** Open the Spotify desktop app on the PC (or on the iPhone) and play any
+   song for a second so Spotify sees the device.
+5. **Connect.** Open `http://127.0.0.1:3000` and type the passcode. Then open
+   `http://127.0.0.1:3000/auth/login` and approve Spotify. Then search, queue songs, and try skip votes with two names in two browsers.
+
+When you move to Railway later, follow the steps below and add the Railway redirect URI
+to the same Spotify app.
+
 ## 1. Railway: create the project and get its URL
 
 1. On [railway.com](https://railway.com), click **New Project → Deploy from GitHub repo** and pick `our-fm`.
