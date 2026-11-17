@@ -68,7 +68,7 @@ Env vars (all in `.env.example` with placeholder values; `.env` is gitignored):
 
 | Var | Required | Notes |
 |---|---|---|
-| `OFFICE_PASSCODE` | yes | At least 6 characters, otherwise startup fails. |
+| `OFFICE_PASSCODE` | yes | At least 8 characters, otherwise startup fails. |
 | `SPOTIFY_CLIENT_ID` | yes | |
 | `SPOTIFY_CLIENT_SECRET` | yes | |
 | `SPOTIFY_REDIRECT_URI` | yes | e.g. `https://our-fm-production.up.railway.app/auth/callback` |
@@ -80,14 +80,16 @@ Constants in `config.js`: `MAX_QUEUED_PER_PERSON = 3`, `SKIP_VOTES = 3`,
 `SKIP_VOTES_WITH_REQUESTER = 2`, `TICK_MS = 3000`, `START_GRACE_MS = 5000`,
 `LOOKAHEAD_MS = 3500`.
 
-Local run: `npm run dev` = `node --env-file-if-exists=.env src/server.js`.
-Railway: `npm start` = `node src/server.js`; `engines.node` is `>=24`.
+Local run: `npm run dev` = `node --disable-warning=ExperimentalWarning --env-file-if-exists=.env src/server.js`.
+Railway: `npm start` = `node --disable-warning=ExperimentalWarning src/server.js`; `engines.node` is `24.x`
+(`node:sqlite` is still flagged experimental in Node 24 but needs no flag).
 
 ## Identity
 
 No accounts. On first visit the page asks for a display name and creates a
-random `clientId` (UUID); both live in `localStorage`. Requests carry both in
-the JSON body (or query for GET). The **clientId** keys the per-person cap,
+random `clientId` (UUID); both live in `localStorage`. Every API request sends
+the clientId in an `X-Client-Id` header (kept out of URLs and logs); mutating
+requests also send `name` in the JSON body. The **clientId** keys the per-person cap,
 skip votes and "remove my own song"; the **name** is for display and is what
 `plays.requested_by` records. This is spoofable by anyone with dev tools; that
 is accepted for 8 trusted colleagues behind a passcode. The clientId only
@@ -148,6 +150,9 @@ CREATE TABLE IF NOT EXISTS skip_votes (
   refresh token in the response replaces the stored one.
 - On 401: refresh once and retry. On `invalid_grant`: delete the refresh token
   (status becomes `needs_auth`).
+- On 403 (e.g. a Development Mode restriction or a non-Premium account):
+  throw a `SpotifyError` whose message names the endpoint; the player shows it
+  as status `error`, search/queue return 502 with that message.
 - On 429: throw a `RateLimited` error carrying `Retry-After`; the player skips
   ticks until then.
 - Never log tokens, codes or the Authorization header.
@@ -177,8 +182,10 @@ checks the play id it was scheduled for, so nothing double-advances.
      - Not playing and (`progress == 0` or `remaining < 2000`) → `advance(cur.id)`.
      - Not playing mid-track → `paused` (someone paused the iPhone); wait.
    - `p` shows something else or nothing, and `cur` started more than
-     `START_GRACE_MS` ago → `advance(cur.id)`. This also reconciles a stale
-     current play after a server restart.
+     `START_GRACE_MS` ago → count a miss; on the **second consecutive** miss
+     `advance(cur.id)` (a single transient 204 doesn't end a song). Seeing
+     `cur` resets the counter. This also reconciles a stale current play after
+     a server restart, and a play that never actually started.
 5. If no `cur` and the queue is non-empty → `startNext()`.
 6. If no `cur` and the queue is empty → `autopick.pick()`; when it returns a
    track, enqueue it with source `auto` and `startNext()`. In v1 it returns
@@ -198,6 +205,10 @@ autoplay can't play unlogged songs (errors from pause are ignored).
 4. Success → in one transaction delete the queue row and insert the plays row
    with `started_at = now` → `playing`.
 
+The lookahead timer is kept on purpose: without it each song change has up
+to 3 s of silence. It is one timer, armed once per play id, run inside the
+lock, and it re-checks the play id, so it cannot double-advance.
+
 Errors other than 429/auth: log a short message, status `error` with message,
 retry next tick. The loop never throws out.
 
@@ -209,7 +220,11 @@ retry next tick. The loop never throws out.
 - otherwise → `SKIP_VOTES` (3).
 
 `player.skip(clientId, name)`, inside the lock: no current play → 409.
-Insert vote (idempotent per voter). If distinct voters ≥ needed →
+Insert vote (idempotent per voter). Votes belong to one play, so they reset
+with every song. A vote counts toward the threshold only if both its clientId
+and its normalized name (trimmed, lower-case) are new for this play, so
+clearing localStorage and re-entering your name doesn't add a vote. The
+requester is recognised by `requester_id`. If counted voters ≥ needed →
 `advance(cur.id, {skipped: true, progressMs: estimated current progress})`.
 Returns `{votes, needed, skipped}`.
 
@@ -228,6 +243,14 @@ capped at `duration_ms`.
   the login page and static assets. API calls without the cookie get 401; the
   page shows the passcode form instead of the app (the client checks via
   `GET /api/state` → 401).
+- The cookie value is a static secret shared by all browsers; it stays valid
+  until the passcode changes. Accepted for this audience.
+- `Secure` is set when `req.secure` is true, which works behind Railway's proxy
+  because `trust proxy` is set.
+- Every response gets `X-Content-Type-Options: nosniff`,
+  `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`, and
+  `Content-Security-Policy: default-src 'self'; img-src 'self' https://i.scdn.co; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'`.
+  Spotify cover art comes from `i.scdn.co`.
 - Mutating routes (`POST`, `DELETE`) require `Content-Type: application/json`,
   else 415. With `SameSite=Lax` this blocks cross-site form posts.
 
@@ -252,11 +275,11 @@ All JSON. All need the cookie except where noted.
 |---|---|---|
 | `GET /healthz` (open) | | `200 ok` |
 | `POST /api/login` (open) | `{passcode}` | 204 + cookie; 401; 429 |
-| `GET /api/state` | `?clientId` | `{status, message, nowPlaying, queue, serverTime, me:{queued, max}}` |
+| `GET /api/state` | header `X-Client-Id` | `{status, message, nowPlaying, queue, serverTime, me:{queued, max}}` |
 | `GET /api/search` | `?q` (1–100 chars) | `{tracks:[…]}` (needs connection, else 503) |
-| `POST /api/queue` | `{trackId, name, clientId}` | 201 item; 400 invalid; 409 duplicate or "limit reached"; 503 not connected |
-| `DELETE /api/queue/:id` | `{clientId}` | 204; 403 not yours; 404 |
-| `POST /api/skip` | `{name, clientId}` | `{votes, needed, skipped}`; 409 nothing playing |
+| `POST /api/queue` | `{trackId, name}` | 201 item; 400 invalid; 409 duplicate or "limit reached"; 503 not connected |
+| `DELETE /api/queue/:id` | (header) | 204; 403 not yours; 404 |
+| `POST /api/skip` | `{name}` | `{votes, needed, skipped}`; 409 nothing playing |
 | `GET /auth/login`, `GET /auth/callback` | | see above |
 
 `nowPlaying`: `{playId, trackId, title, artist, album, imageUrl, durationMs,
@@ -266,7 +289,8 @@ explicit, requestedBy, source, mine}`.
 
 `POST /api/queue` fetches the track from `GET /v1/tracks/{id}` (client metadata
 is not trusted). It rejects a track that is already queued or currently
-playing (409), and enforces `MAX_QUEUED_PER_PERSON` pending requests per
+playing (409); requests are not otherwise blocked by recent plays — the 2 h
+no-repeat rule applies to auto-picks only. It enforces `MAX_QUEUED_PER_PERSON` pending requests per
 `clientId` (409 with a clear message). After inserting, it nudges the player
 (`player.kick()` runs a tick now) so an idle system starts within a second.
 
@@ -274,7 +298,8 @@ Error bodies: `{error: "human readable message"}`.
 
 ## UI (`public/`)
 
-Single page, plain HTML + one script, no framework. Mobile friendly.
+Single page, plain HTML + one script, no framework, no inline script (CSP).
+Mobile friendly.
 
 1. **Passcode view** when `/api/state` returns 401.
 2. **Name prompt** on first visit (stored with a generated clientId); a small
