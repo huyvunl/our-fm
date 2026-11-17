@@ -148,7 +148,7 @@ test('authorizeUrl includes scopes and state', () => {
   assert.equal(u.origin + u.pathname, 'https://accounts.spotify.com/authorize');
   assert.equal(u.searchParams.get('response_type'), 'code');
   assert.equal(u.searchParams.get('client_id'), 'cid');
-  assert.equal(u.searchParams.get('scope'), 'user-read-playback-state user-modify-playback-state');
+  assert.equal(u.searchParams.get('scope'), 'user-read-playback-state user-modify-playback-state user-read-private');
   assert.equal(u.searchParams.get('redirect_uri'), 'http://x/cb');
   assert.equal(u.searchParams.get('state'), 'st8');
 });

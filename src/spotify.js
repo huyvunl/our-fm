@@ -1,7 +1,7 @@
 const API = 'https://api.spotify.com';
 const TOKEN_URL = 'https://accounts.spotify.com/api/token';
 const AUTH_URL = 'https://accounts.spotify.com/authorize';
-const SCOPES = 'user-read-playback-state user-modify-playback-state';
+const SCOPES = 'user-read-playback-state user-modify-playback-state user-read-private';
 const REFRESH_KEY = 'refresh_token';
 
 export class SpotifyError extends Error {
