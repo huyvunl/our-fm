@@ -2,10 +2,13 @@
 
 const POLL_MS = 3000;
 const SEARCH_DEBOUNCE_MS = 400;
+const TOAST_MS = 6000;
+const FAILED_POLLS_BEFORE_BANNER = 3;
 const BANNERS = {
   no_device: 'Open Spotify on the speaker iPhone',
   needs_auth: "Spotify isn't connected yet — owner: open /auth/login",
   idle: 'Queue is empty — add a song',
+  paused: 'Paused on the speaker iPhone',
 };
 
 const $ = (id) => document.getElementById(id);
@@ -29,6 +32,9 @@ let authed = false;
 let results = [];
 let searchSeq = 0;
 let inflight = false;
+let failedPolls = 0;
+let toastTimer = null;
+let resultsKey = null;
 
 // ---- helpers ----
 function el(tag, className, text) {
@@ -55,6 +61,8 @@ function setCover(img, url) {
 function toast(message) {
   $('toast-text').textContent = message;
   $('toast').classList.remove('hidden');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => $('toast').classList.add('hidden'), TOAST_MS);
 }
 
 async function api(path, { method = 'GET', body } = {}) {
@@ -62,7 +70,7 @@ async function api(path, { method = 'GET', body } = {}) {
   const init = { method, headers };
   if (method !== 'GET') {
     headers['Content-Type'] = 'application/json';
-    if (body) init.body = JSON.stringify({ name, ...body });
+    init.body = JSON.stringify({ name, ...(body ?? {}) });
   }
   const res = await fetch(path, init);
   if (res.status === 401) {
@@ -99,9 +107,11 @@ function renderViews() {
 
 function renderBanner() {
   const banner = $('banner');
-  const text = state.status === 'error' ? state.message : BANNERS[state.status];
+  const text = failedPolls >= FAILED_POLLS_BEFORE_BANNER
+    ? 'Reconnecting…'
+    : (state.status === 'error' ? state.message : BANNERS[state.status]);
   banner.classList.toggle('hidden', !text);
-  banner.classList.toggle('error', state.status === 'error');
+  banner.classList.toggle('error', failedPolls >= FAILED_POLLS_BEFORE_BANNER || state.status === 'error');
   banner.textContent = text || '';
 }
 
@@ -116,7 +126,7 @@ function renderNow() {
   setCover($('now-cover'), np.imageUrl);
   $('t-total').textContent = fmt(np.durationMs);
   const btn = $('skip');
-  const tally = `${np.votes.length}/${np.votesNeeded}`;
+  const tally = `${np.voteCount}/${np.votesNeeded}`;
   btn.textContent = np.iVoted ? `Voted (${tally})` : `Skip (${tally})`;
   btn.disabled = np.iVoted;
   tickProgress();
@@ -154,15 +164,23 @@ function renderSlots() {
 
 function renderResults() {
   const list = $('results');
-  list.replaceChildren();
   const full = state ? state.me.queued >= state.me.max : false;
+  const key = JSON.stringify([results.map((t) => t.id), state ? state.me.queued : null, full]);
+  if (key === resultsKey) return;
+  resultsKey = key;
+  list.replaceChildren();
   for (const track of results) {
     const btn = el('button', '', full ? 'Limit reached' : 'Add');
     btn.type = 'button';
     btn.disabled = full;
     btn.addEventListener('click', () => act(async () => {
       btn.disabled = true;
-      await api('/api/queue', { method: 'POST', body: { trackId: track.id } });
+      try {
+        await api('/api/queue', { method: 'POST', body: { trackId: track.id } });
+      } catch (e) {
+        btn.disabled = false;
+        throw e;
+      }
     }));
     list.append(trackRow(track, { subtitle: `${track.artist} · ${fmt(track.durationMs)}`, button: btn }));
   }
@@ -202,9 +220,11 @@ async function refresh() {
     state = await api('/api/state');
     receivedAt = Date.now();
     authed = true;
+    failedPolls = 0;
     render();
   } catch {
-    /* 401 is handled in api(); transient network errors retry on the next poll */
+    // 401 is handled in api(); other failures retry on the next poll
+    if (authed && ++failedPolls >= FAILED_POLLS_BEFORE_BANNER && state) renderBanner();
   } finally {
     inflight = false;
   }
@@ -272,7 +292,10 @@ $('change-name').addEventListener('click', () => {
   $('name-input').focus();
 });
 
-$('skip').addEventListener('click', () => act(() => api('/api/skip', { method: 'POST' })));
+$('skip').addEventListener('click', () => act(() => api('/api/skip', {
+  method: 'POST',
+  body: { playId: state?.nowPlaying?.playId },
+})));
 
 $('toast-close').addEventListener('click', () => $('toast').classList.add('hidden'));
 
