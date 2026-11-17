@@ -9,6 +9,15 @@ export class NothingPlayingError extends Error {
   }
 }
 
+export class StalePlayError extends Error {
+  constructor() {
+    super('That song already changed');
+    this.name = 'StalePlayError';
+  }
+}
+
+const NO_DEVICE_MSG = 'Open Spotify on the speaker iPhone';
+const NETWORK_MSG = "Can't reach Spotify right now — retrying";
 const REFUSAL_BACKOFF_MS = 60_000;
 const END_WINDOW_MS = 2000;
 
@@ -28,6 +37,9 @@ export function createPlayer({
   let lastDeviceId = null;
   let lookahead = null; // { playId, handle }
   let interval = null;
+  let unseenPlayId = null; // a play this process started that Spotify has not yet shown playing
+  let lastLoggedError = null;
+  let tickPromise = null;
 
   let chain = Promise.resolve();
   function locked(fn) {
@@ -65,8 +77,11 @@ export function createPlayer({
       backoffUntil = clock.now() + e.retryAfterMs;
       return log.warn(`Spotify rate limited; backing off ${e.retryAfterMs} ms`);
     }
-    log.error('player error:', e.message);
-    setStatus('error', e.message);
+    if (e.message !== lastLoggedError) log.error('player error:', e.message);
+    lastLoggedError = e.message;
+    const network = !(e instanceof SpotifyError)
+      && (e instanceof TypeError || e.name === 'TimeoutError' || e.name === 'AbortError' || e.cause != null);
+    setStatus('error', network ? NETWORK_MSG : e.message);
   }
 
   function handleRefusal(e, item) {
@@ -86,14 +101,14 @@ export function createPlayer({
     try {
       let item = store.listQueue()[0];
       if (!item) {
-        const t = await autopick.pick({ store, now: clock.now() });
+        const t = await autopick.pick({ store, spotify, now: clock.now() });
         if (t) item = store.enqueue(t, { source: 'auto' }, clock.now());
       }
       if (!item) { setStatus('idle'); return 'empty'; }
 
       const devices = await spotify.getDevices();
       const device = (deviceName && devices.find((d) => d.name === deviceName)) || devices[0];
-      if (!device) { setStatus('no_device', 'Open Spotify on the speaker iPhone'); return 'waiting'; }
+      if (!device) { setStatus('no_device', NO_DEVICE_MSG); return 'waiting'; }
 
       try {
         try {
@@ -105,7 +120,7 @@ export function createPlayer({
         }
       } catch (e) {
         if (e instanceof SpotifyError && e.status === 404) {
-          setStatus('no_device', 'Open Spotify on the speaker iPhone');
+          setStatus('no_device', NO_DEVICE_MSG);
         } else if (e instanceof SpotifyError && (e.status === 400 || e.status === 403)) {
           handleRefusal(e, item);
         } else {
@@ -114,7 +129,9 @@ export function createPlayer({
         return 'waiting';
       }
 
-      store.startPlay(item.id, clock.now());
+      if (!store.getQueueItem(item.id)) { log.debug?.('queue item removed before it started; continuing'); return 'waiting'; }
+      const play = store.startPlay(item.id, clock.now());
+      unseenPlayId = play.id;
       lastDeviceId = device.id;
       refusals = 0;
       misses = 0;
@@ -142,6 +159,16 @@ export function createPlayer({
     }
   }
 
+  // Must be called from inside the lock. The song never showed up on Spotify: put it back.
+  function unstart(cur) {
+    store.unstartPlay(cur.id);
+    cancelLookahead();
+    unseenPlayId = null;
+    lastIsPlaying = false;
+    misses = 0;
+    setStatus('no_device', NO_DEVICE_MSG);
+  }
+
   async function tickBody() {
     if (!spotify.isConnected()) return setStatus('needs_auth', "Spotify isn't connected yet — owner: open /auth/login");
     if (clock.now() < backoffUntil) return;
@@ -154,6 +181,8 @@ export function createPlayer({
     }
     if (p && p.trackId === cur.trackId) {
       misses = 0;
+      if (cur.id === unseenPlayId && (p.isPlaying || p.progressMs > 0)) unseenPlayId = null;
+      const pastGrace = clock.now() - Date.parse(cur.startedAt) > START_GRACE_MS;
       lastProgressMs = p.progressMs;
       lastIsPlaying = p.isPlaying;
       lastUpdateAt = clock.now();
@@ -162,30 +191,41 @@ export function createPlayer({
       if (p.isPlaying) {
         setStatus('playing');
         if (remaining <= LOOKAHEAD_MS) armLookahead(cur.id, remaining);
+        else if (lookahead?.playId === cur.id) cancelLookahead();
       } else if (p.progressMs === 0 || remaining < END_WINDOW_MS) {
-        await advance(cur.id);
+        if (lookahead?.playId === cur.id) cancelLookahead();
+        if (cur.id !== unseenPlayId) await advance(cur.id);
+        else if (pastGrace) unstart(cur);
       } else {
+        if (lookahead?.playId === cur.id) cancelLookahead();
         setStatus('paused');
       }
     } else if (clock.now() - Date.parse(cur.startedAt) > START_GRACE_MS) {
-      if (++misses >= 2) await advance(cur.id);
+      if (++misses >= 2) {
+        if (cur.id === unseenPlayId) unstart(cur);
+        else await advance(cur.id);
+      }
     }
   }
 
   function tick() {
-    return locked(async () => {
+    if (tickPromise) return tickPromise;
+    tickPromise = locked(async () => {
       try {
         await tickBody();
+        lastLoggedError = null;
       } catch (e) {
         handleError(e);
       }
-    }).catch((e) => log.error('tick failed:', e.message));
+    }).catch((e) => log.error('tick failed:', e.message)).finally(() => { tickPromise = null; });
+    return tickPromise;
   }
 
-  function skip(clientId, name) {
+  function skip(clientId, name, playId) {
     return locked(async () => {
       const cur = store.currentPlay();
       if (!cur) throw new NothingPlayingError();
+      if (cur.id !== playId) throw new StalePlayError();
       store.addSkipVote(cur.id, clientId, name, clock.now());
       const { votes, needed, passed } = evaluateSkip(cur, store.listSkipVotes(cur.id));
       if (passed) await advance(cur.id, { skipped: true, progressMs: estimate(cur) });
@@ -215,6 +255,7 @@ export function createPlayer({
       if (interval) clock.clearInterval(interval);
       interval = null;
       cancelLookahead();
+      return chain.then(() => {});
     },
   };
 }

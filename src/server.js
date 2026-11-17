@@ -28,8 +28,8 @@ const server = app.listen(config.port, () => {
   player.start();
 });
 
-function shutdown() {
-  player.stop();
+async function shutdown() {
+  await player.stop();
   server.close(() => {
     store.close();
     process.exit(0);

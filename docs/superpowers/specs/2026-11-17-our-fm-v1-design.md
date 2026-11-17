@@ -185,7 +185,12 @@ checks the play id it was scheduled for, so nothing double-advances.
      `START_GRACE_MS` ago → count a miss; on the **second consecutive** miss
      `advance(cur.id)` (a single transient 204 doesn't end a song). Seeing
      `cur` resets the counter. This also reconciles a stale current play after
-     a server restart, and a play that never actually started.
+     a server restart. A play this process started but never saw playing
+     (`isPlaying`, or progress > 0) is not consumed: once past the grace
+     period, a stopped-at-0 observation or the second miss *unstarts* it
+     (the plays row and its skip votes are deleted and the queue row returns
+     with its original id, keeping its place) and the status becomes
+     `no_device`; the next tick retries.
 5. If no `cur` and the queue is non-empty → `startNext()`.
 6. If no `cur` and the queue is empty → `autopick.pick()`; when it returns a
    track, enqueue it with source `auto` and `startNext()`. In v1 it returns

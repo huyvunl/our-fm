@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createApp } from '../src/app.js';
 import { openDb } from '../src/db.js';
 import { SpotifyError, NotConnectedError } from '../src/spotify.js';
-import { NothingPlayingError } from '../src/player.js';
+import { NothingPlayingError, StalePlayError } from '../src/player.js';
 import { cookieValueFor } from '../src/auth.js';
 
 const PASS = 'office-pass-1';
@@ -215,14 +215,21 @@ test('remove own 204, someone else 403, missing 404', async (t) => {
 
 test('skip returns player result; NothingPlayingError 409', async (t) => {
   const s = await setup(); t.after(s.close);
-  const r = await s.api('/api/skip', { method: 'POST', body: { name: 'Ann' } });
+  const r = await s.api('/api/skip', { method: 'POST', body: { name: 'Ann', playId: 3 } });
   assert.equal(r.status, 200);
   assert.deepEqual(r.json, { votes: 1, needed: 3, skipped: false });
   const s2 = await setup({ player: { skip: async () => { throw new NothingPlayingError(); } } });
   t.after(s2.close);
-  const r2 = await s2.api('/api/skip', { method: 'POST', body: { name: 'Ann' } });
+  const r2 = await s2.api('/api/skip', { method: 'POST', body: { name: 'Ann', playId: 3 } });
   assert.equal(r2.status, 409);
   assert.equal(r2.json.error, 'Nothing is playing');
+  const s3 = await setup({ player: { skip: async () => { throw new StalePlayError(); } } });
+  t.after(s3.close);
+  const r3 = await s3.api('/api/skip', { method: 'POST', body: { name: 'Ann', playId: 2 } });
+  assert.equal(r3.status, 409);
+  assert.equal(r3.json.error, 'That song already changed');
+  assert.equal((await s.api('/api/skip', { method: 'POST', body: { name: 'Ann' } })).status, 400);
+  assert.equal((await s.api('/api/skip', { method: 'POST', body: { name: 'Ann', playId: 'x' } })).status, 400);
 });
 
 test('missing or bad X-Client-Id 400; empty name 400', async (t) => {
@@ -230,8 +237,8 @@ test('missing or bad X-Client-Id 400; empty name 400', async (t) => {
   assert.equal((await s.api('/api/state', { clientId: null })).status, 400);
   assert.equal((await s.api('/api/state', { clientId: 'short' })).status, 400);
   assert.equal((await s.api('/api/state', { clientId: 'bad id with spaces!' })).status, 400);
-  assert.equal((await s.api('/api/skip', { method: 'POST', body: { name: '  ' } })).status, 400);
-  assert.equal((await s.api('/api/skip', { method: 'POST', body: { name: 'x'.repeat(31) } })).status, 400);
+  assert.equal((await s.api('/api/skip', { method: 'POST', body: { name: '  ', playId: 1 } })).status, 400);
+  assert.equal((await s.api('/api/skip', { method: 'POST', body: { name: 'x'.repeat(31), playId: 1 } })).status, 400);
 });
 
 test('search: empty q 400; SpotifyError 502 with message', async (t) => {
@@ -281,4 +288,26 @@ test('/auth/callback with access_denied redirects home after the state check', a
   assert.equal(r.status, 302);
   assert.equal(r.headers.get('location'), '/');
   assert.deepEqual(s.calls.exchangeCode, []);
+});
+
+test('page request shapes: skip {name, playId}, queue {name, trackId}, delete {name}', async (t) => {
+  const got = [];
+  const s = await setup({ player: { skip: async (c, n, id) => { got.push([c, n, id]); return { votes: 1, needed: 3, skipped: false }; } } });
+  t.after(s.close);
+  assert.equal((await s.api('/api/skip', { method: 'POST', body: { name: 'Ann', playId: 7 } })).status, 200);
+  assert.deepEqual(got, [[A, 'Ann', 7]]);
+  assert.equal((await s.api('/api/queue', { method: 'POST', body: { name: 'Ann', trackId: 'abc123' } })).status, 201);
+  const id = s.store.listQueue()[0].id;
+  assert.equal((await s.api(`/api/queue/${id}`, { method: 'DELETE', body: { name: 'Ann' } })).status, 204);
+});
+
+test('state nowPlaying voteCount counts distinct voters', async (t) => {
+  const s = await setup(); t.after(s.close);
+  const q = s.store.enqueue(track('v1'), { requestedBy: 'Ann', requesterId: A, source: 'request' }, 1);
+  const p = s.store.startPlay(q.id, 2);
+  s.store.addSkipVote(p.id, B, 'Bob', 3);
+  s.store.addSkipVote(p.id, 'client-cccccccc', 'bob', 4); // same name, not counted
+  const np = (await s.api('/api/state')).json.nowPlaying;
+  assert.equal(np.votes.length, 2);
+  assert.equal(np.voteCount, 1);
 });

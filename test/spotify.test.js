@@ -152,3 +152,10 @@ test('authorizeUrl includes scopes and state', () => {
   assert.equal(u.searchParams.get('redirect_uri'), 'http://x/cb');
   assert.equal(u.searchParams.get('state'), 'st8');
 });
+
+test('every fetch carries a timeout signal', async () => {
+  const { calls, spotify } = setup([tokenRes(), json({ devices: [] })]);
+  await spotify.getDevices();
+  assert.equal(calls.length, 2);
+  for (const c of calls) assert.ok(c.init.signal instanceof AbortSignal);
+});

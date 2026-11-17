@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { openDb } from '../src/db.js';
 import { SpotifyError, RateLimitedError } from '../src/spotify.js';
-import { createPlayer, NothingPlayingError } from '../src/player.js';
+import { createPlayer, NothingPlayingError, StalePlayError } from '../src/player.js';
 
 const track = (n) => ({
   id: `t${n}`, uri: `spotify:track:t${n}`, title: `Song ${n}`, artist: 'Artist', artistId: 'ar',
@@ -50,7 +50,8 @@ function setup(deviceName = null) {
   const player = mk();
   const add = (n, who = 'a') => store.enqueue(track(n), { requestedBy: who, requesterId: who, source: 'request' }, clock.now());
   const show = (n, o = {}) => { spotify.player = { trackId: `t${n}`, progressMs: 1000, isPlaying: true, deviceId: 'd1', ...o }; };
-  return { store, spotify, clock, player, add, show, mk };
+  const seen = async (n = 1, o = {}) => { show(n, o); await player.tick(); };
+  return { store, spotify, clock, player, add, show, mk, seen };
 }
 
 test('needs_auth when not connected', async () => {
@@ -113,10 +114,11 @@ test('play 403 drops the item', async () => {
 });
 
 test('advances when Spotify shows another track twice after grace', async () => {
-  const { store, spotify, clock, player, add, show } = setup();
+  const { store, spotify, clock, player, add, show , seen } = setup();
   add(1); add(2);
   await player.tick();
   clock.t += 6000;
+  await seen(1);
   show(9);
   await player.tick();
   assert.equal(store.currentPlay().trackId, 't1');
@@ -141,10 +143,11 @@ test('ignores mismatch during the start grace', async () => {
 });
 
 test('single null player response does not end the song; two in a row do', async () => {
-  const { store, spotify, clock, player, add, show } = setup();
+  const { store, spotify, clock, player, add, show , seen } = setup();
   add(1); add(2);
   await player.tick();
   clock.t += 6000;
+  await seen(1);
   spotify.player = null;
   await player.tick();
   assert.equal(store.currentPlay().trackId, 't1');
@@ -158,10 +161,11 @@ test('single null player response does not end the song; two in a row do', async
 });
 
 test('iPhone asleep: song ends after two misses and next waits with no_device', async () => {
-  const { store, spotify, clock, player, add } = setup();
+  const { store, spotify, clock, player, add , seen } = setup();
   add(1); add(2);
   await player.tick();
   clock.t += 6000;
+  await seen(1);
   spotify.player = null;
   spotify.devices = [];
   await player.tick();
@@ -172,10 +176,11 @@ test('iPhone asleep: song ends after two misses and next waits with no_device', 
 });
 
 test('advances when stopped at the end', async () => {
-  const { store, clock, player, add, show } = setup();
+  const { store, clock, player, add, show , seen } = setup();
   add(1); add(2);
   await player.tick();
   clock.t += 6000;
+  await seen(1);
   show(1, { isPlaying: false, progressMs: 0 });
   await player.tick();
   assert.equal(store.currentPlay().trackId, 't2');
@@ -209,10 +214,11 @@ test('lookahead timer starts the next song at the end; no second timer in window
 });
 
 test('pauses Spotify when the last song ends and the queue is empty', async () => {
-  const { spotify, clock, player, add, show } = setup();
+  const { spotify, clock, player, add, show , seen } = setup();
   add(1);
   await player.tick();
   clock.t += 6000;
+  await seen(1);
   show(1, { isPlaying: false, progressMs: 0 });
   await player.tick();
   assert.deepEqual(spotify.calls.filter((c) => c[0] === 'pause'), [['pause', 'd1']]);
@@ -241,7 +247,7 @@ test('restart: open play still shown keeps playing; one not shown ends after two
   assert.equal(store.currentPlay(), null);
 });
 
-const vote = (p, id) => p.skip(id, `Name ${id}`);
+const vote = (p, id, playId = 1) => p.skip(id, `Name ${id}`, playId);
 
 test('skip: two non-requester votes do not skip, third does', async () => {
   const { store, clock, player, add, show } = setup();
@@ -323,7 +329,7 @@ test('second refusal in a row keeps the queue and backs off 60 s', async () => {
 });
 
 test('successful play resets the refusal counter', async () => {
-  const { store, spotify, clock, player, add, show } = setup();
+  const { store, spotify, clock, player, add, show , seen } = setup();
   let fail = true;
   spotify.playFn = async () => { if (fail) throw new SpotifyError('nope', 400); };
   add(1); add(2); add(3);
@@ -332,6 +338,7 @@ test('successful play resets the refusal counter', async () => {
   await player.tick(); // plays song 2
   fail = true;
   clock.t += 6000;
+  await seen(2);
   show(2, { isPlaying: false, progressMs: 0 });
   await player.tick(); // song 2 ends; song 3 refused: counted as first again, dropped
   assert.equal(store.listQueue().length, 0);
@@ -357,4 +364,146 @@ test('start/stop manage the interval', async () => {
   assert.deepEqual([...clock.intervals.values()], [3000]);
   player.stop();
   assert.equal(clock.intervals.size, 0);
+});
+
+test('a play that never starts goes back to the head of the queue', async () => {
+  const { store, clock, player, add, show } = setup();
+  const first = add(1); const second = add(2);
+  await player.tick();
+  const startedPlayId = store.currentPlay().id;
+  store.addSkipVote(startedPlayId, 'x', 'X', clock.now());
+  clock.t += 6000;
+  show(1, { isPlaying: false, progressMs: 0 });
+  await player.tick();
+  assert.equal(store.currentPlay(), null);
+  assert.equal(store.getPlay(startedPlayId), null);
+  assert.deepEqual(store.listQueue().map((q) => [q.id, q.trackId]), [[first.id, 't1'], [second.id, 't2']]);
+  assert.equal(player.getState().status, 'no_device');
+  assert.equal(player.getState().message, 'Open Spotify on the speaker iPhone');
+  assert.equal(store.listSkipVotes(startedPlayId).length, 0);
+});
+
+test('a play that never shows up (two misses) is also returned to the queue', async () => {
+  const { store, spotify, clock, player, add } = setup();
+  add(1);
+  await player.tick();
+  clock.t += 6000;
+  spotify.player = null;
+  await player.tick();
+  assert.ok(store.currentPlay());
+  await player.tick();
+  assert.equal(store.currentPlay(), null);
+  assert.deepEqual(store.listQueue().map((q) => q.trackId), ['t1']);
+});
+
+test('stopped at 0 after having played still advances', async () => {
+  const { store, clock, player, add, seen, show } = setup();
+  add(1); add(2);
+  await player.tick();
+  clock.t += 6000;
+  await seen(1);
+  show(1, { isPlaying: false, progressMs: 0 });
+  await player.tick();
+  assert.equal(store.currentPlay().trackId, 't2');
+  assert.equal(store.getPlay(1).skipped, false);
+});
+
+test('stopped at 0 within the start grace waits', async () => {
+  const { store, clock, player, add, show } = setup();
+  add(1);
+  await player.tick();
+  clock.t += 2000;
+  show(1, { isPlaying: false, progressMs: 0 });
+  await player.tick();
+  assert.equal(store.currentPlay().trackId, 't1');
+});
+
+test('skip for a play that already changed is rejected without a vote', async () => {
+  const { store, clock, player, add, seen } = setup();
+  add(1, 'r'); add(2);
+  await player.tick();
+  clock.t += 6000;
+  await seen(1);
+  await vote(player, 'x'); await vote(player, 'y');
+  await vote(player, 'z'); // skips play 1; play 2 now current
+  assert.equal(store.currentPlay().trackId, 't2');
+  await assert.rejects(vote(player, 'w', 1), StalePlayError);
+  assert.equal(store.listSkipVotes(2).length, 0);
+});
+
+test('lookahead timer is cancelled when the same play is paused or far from the end', async () => {
+  const { clock, player, add, show } = setup();
+  add(1);
+  await player.tick();
+  clock.t += 6000;
+  show(1, { progressMs: 198000 });
+  await player.tick();
+  assert.equal(clock.timers.length, 1);
+  show(1, { progressMs: 198000, isPlaying: false });
+  await player.tick();
+  assert.equal(clock.timers.length, 0);
+  show(1, { progressMs: 198000 });
+  await player.tick();
+  assert.equal(clock.timers.length, 1);
+  show(1, { progressMs: 10000 }); // seeked back
+  await player.tick();
+  assert.equal(clock.timers.length, 0);
+});
+
+test('queue row removed before play starts is not an error', async () => {
+  const { store, spotify, player, add } = setup();
+  const item = add(1);
+  const orig = spotify.getDevices;
+  spotify.getDevices = async () => { store.removeQueueItem(item.id); return orig(); };
+  await player.tick();
+  assert.notEqual(player.getState().status, 'error');
+  assert.equal(store.currentPlay(), null);
+});
+
+test('two ticks while one is pending cause one getPlayer call', async () => {
+  const { spotify, player } = setup();
+  const a = player.tick();
+  const b = player.tick();
+  await Promise.all([a, b]);
+  assert.equal(spotify.count('getPlayer'), 1);
+  await player.tick();
+  assert.equal(spotify.count('getPlayer'), 2);
+});
+
+test('a repeating error is logged once; network errors get a friendly banner', async () => {
+  const { spotify, store, clock } = setup();
+  const errors = [];
+  const p = createPlayer({ store, spotify, autopick: { pick: async () => null }, clock, log: { ...quiet, error: (...a) => errors.push(a.join(' ')) } });
+  spotify.player = new TypeError('fetch failed');
+  await p.tick(); await p.tick(); await p.tick();
+  assert.equal(errors.length, 1);
+  assert.equal(p.getState().status, 'error');
+  assert.equal(p.getState().message, "Can't reach Spotify right now — retrying");
+});
+
+test('stop() resolves after in-flight work drains', async () => {
+  const { spotify, player, add } = setup();
+  add(1);
+  let release;
+  spotify.getDevices = () => new Promise((r) => { release = () => r([{ id: 'd1', name: 'x' }]); });
+  const t = player.tick();
+  let stopped = false;
+  const st = player.stop().then(() => { stopped = true; });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(stopped, false);
+  release();
+  await t; await st;
+  assert.equal(stopped, true);
+});
+
+test('autopick receives store, spotify and now', async () => {
+  const store = openDb(':memory:');
+  const spotify = fakeSpotify();
+  const clock = fakeClock();
+  let ctx;
+  const p = createPlayer({ store, spotify, autopick: { pick: async (c) => { ctx = c; return null; } }, clock, log: quiet });
+  await p.tick();
+  assert.equal(ctx.store, store);
+  assert.equal(ctx.spotify, spotify);
+  assert.equal(ctx.now, clock.now());
 });

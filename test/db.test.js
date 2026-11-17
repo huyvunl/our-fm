@@ -104,3 +104,19 @@ test('file db creates parent dir', () => {
   assert.ok(fs.existsSync(p));
   db.close();
 });
+
+test('unstartPlay restores the queue row with its id and place, and drops votes', () => {
+  const db = openDb(':memory:');
+  const a = db.enqueue(track('A'), req(), T);
+  const b = db.enqueue(track('B'), req('Bob', 'c2'), T + 1);
+  const p = db.startPlay(a.id, T + 10);
+  db.addSkipVote(p.id, 'c9', 'Zed', T + 11);
+  db.unstartPlay(p.id);
+  assert.equal(db.currentPlay(), null);
+  assert.equal(db.getPlay(p.id), null);
+  assert.deepEqual(db.listSkipVotes(p.id), []);
+  const q = db.listQueue();
+  assert.deepEqual(q.map((x) => [x.id, x.trackId]), [[a.id, 'A'], [b.id, 'B']]);
+  assert.equal(q[0].addedAt, new Date(T).toISOString());
+  assert.equal(q[0].requestedBy, 'Ann');
+});

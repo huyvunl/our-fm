@@ -3,7 +3,7 @@ import express from 'express';
 import { fileURLToPath } from 'node:url';
 import { MAX_QUEUED_PER_PERSON } from './config.js';
 import { evaluateSkip } from './skip.js';
-import { NothingPlayingError } from './player.js';
+import { NothingPlayingError, StalePlayError } from './player.js';
 import { SpotifyError, NotConnectedError, RateLimitedError } from './spotify.js';
 import {
   COOKIE_NAME, cookieValueFor, passcodeMatches, createLoginLimiter,
@@ -105,6 +105,7 @@ export function createApp({ config, store, spotify, player, now = Date.now, rand
         requestedBy: cur.requestedBy,
         source: cur.source,
         votes: votes.map((v) => v.voterName),
+        voteCount: ev.votes,
         votesNeeded: ev.needed,
         iVoted: votes.some((v) => v.voterId === clientId),
       };
@@ -158,7 +159,9 @@ export function createApp({ config, store, spotify, player, now = Date.now, rand
   api.post('/skip', async (req, res) => {
     const clientId = clientIdOf(req);
     const name = nameOf(req);
-    res.json(await player.skip(clientId, name));
+    const playId = req.body?.playId;
+    if (!Number.isSafeInteger(playId)) throw new HttpError(400, 'Invalid playId');
+    res.json(await player.skip(clientId, name, playId));
   });
 
   api.use((req, res) => res.status(404).json({ error: 'Not found' }));
@@ -189,7 +192,7 @@ export function createApp({ config, store, spotify, player, now = Date.now, rand
 
   // eslint-disable-next-line no-unused-vars
   app.use((err, req, res, next) => {
-    if (err instanceof NothingPlayingError) return res.status(409).json({ error: err.message });
+    if (err instanceof NothingPlayingError || err instanceof StalePlayError) return res.status(409).json({ error: err.message });
     if (err instanceof NotConnectedError) return res.status(503).json({ error: "Spotify isn't connected yet" });
     if (err instanceof RateLimitedError) return res.status(503).json({ error: 'Spotify is busy, try again in a moment' });
     if (err instanceof SpotifyError) return res.status(502).json({ error: err.message });

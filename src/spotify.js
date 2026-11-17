@@ -42,6 +42,8 @@ function mapTrack(t) {
   };
 }
 
+const FETCH_TIMEOUT_MS = 10_000;
+
 export function createSpotify({ clientId, clientSecret, redirectUri, store, fetch = globalThis.fetch, now = Date.now }) {
   let accessToken = null;
   let expiresAt = 0;
@@ -53,6 +55,7 @@ export function createSpotify({ clientId, clientSecret, redirectUri, store, fetc
       method: 'POST',
       headers: { Authorization: basic, 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams(params).toString(),
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
     let body = null;
     try {
@@ -85,7 +88,7 @@ export function createSpotify({ clientId, clientSecret, redirectUri, store, fetc
     const pathOnly = pathAndQuery.split('?')[0];
     for (let attempt = 0; ; attempt++) {
       const token = await ensureToken(attempt > 0);
-      const init = { method, headers: { Authorization: `Bearer ${token}` } };
+      const init = { method, headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) };
       if (body !== undefined) {
         init.headers['Content-Type'] = 'application/json';
         init.body = JSON.stringify(body);

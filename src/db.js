@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS plays (
   requested_by TEXT, requester_id TEXT,
   source TEXT NOT NULL CHECK (source IN ('request','auto')),
   started_at TEXT NOT NULL, ended_at TEXT,
-  skipped INTEGER NOT NULL DEFAULT 0, progress_ms_at_skip INTEGER
+  skipped INTEGER NOT NULL DEFAULT 0, progress_ms_at_skip INTEGER,
+  queue_id INTEGER, added_at TEXT
 );
 CREATE INDEX IF NOT EXISTS plays_started ON plays(started_at);
 
@@ -76,6 +77,9 @@ export function openDb(file) {
   const db = new DatabaseSync(file);
   if (file !== ':memory:') db.exec('PRAGMA journal_mode = WAL');
   db.exec(SCHEMA);
+  const playCols = db.prepare('PRAGMA table_info(plays)').all().map((c) => c.name);
+  if (!playCols.includes('queue_id')) db.exec('ALTER TABLE plays ADD COLUMN queue_id INTEGER');
+  if (!playCols.includes('added_at')) db.exec('ALTER TABLE plays ADD COLUMN added_at TEXT');
 
   const q = (sql) => db.prepare(sql);
 
@@ -126,12 +130,33 @@ export function openDb(file) {
         q('DELETE FROM queue WHERE id = ?').run(queueId);
         const info = q(
           `INSERT INTO plays (track_id, title, artist, artist_id, album, duration_ms, explicit, uri,
-             image_url, requested_by, requester_id, source, started_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             image_url, requested_by, requester_id, source, started_at, queue_id, added_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         ).run(r.track_id, r.title, r.artist, r.artist_id, r.album, r.duration_ms, r.explicit, r.uri,
-          r.image_url, r.requested_by, r.requester_id, r.source, iso(now));
+          r.image_url, r.requested_by, r.requester_id, r.source, iso(now), r.id, r.added_at);
         db.exec('COMMIT');
         return toPlay(q('SELECT * FROM plays WHERE id = ?').get(info.lastInsertRowid));
+      } catch (e) {
+        db.exec('ROLLBACK');
+        throw e;
+      }
+    },
+    // Undo startPlay for a song that never actually played: the queue row returns with its
+    // original id (so it keeps its place), and the play and its skip votes disappear.
+    unstartPlay(playId) {
+      db.exec('BEGIN');
+      try {
+        const r = q('SELECT * FROM plays WHERE id = ?').get(playId);
+        if (!r) throw new Error(`play ${playId} not found`);
+        q('DELETE FROM skip_votes WHERE play_id = ?').run(playId);
+        q('DELETE FROM plays WHERE id = ?').run(playId);
+        q(
+          `INSERT INTO queue (id, track_id, uri, title, artist, artist_id, album, duration_ms, explicit,
+             image_url, requested_by, requester_id, source, added_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(r.queue_id ?? null, r.track_id, r.uri, r.title, r.artist, r.artist_id, r.album, r.duration_ms,
+          r.explicit, r.image_url, r.requested_by, r.requester_id, r.source, r.added_at ?? r.started_at);
+        db.exec('COMMIT');
       } catch (e) {
         db.exec('ROLLBACK');
         throw e;
