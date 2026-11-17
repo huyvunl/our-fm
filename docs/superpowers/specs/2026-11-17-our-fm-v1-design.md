@@ -336,6 +336,7 @@ inserted with `textContent` (no HTML injection from song titles or names).
 | Spotify not connected | status `needs_auth`; search and queueing return 503 (the track can't be looked up). |
 | No device | `no_device`; queue kept; retried each tick. |
 | 404 on play | transfer + one retry, then `no_device`. |
+| 400/403 on play | first time: drop that item with a message; second in a row: keep the queue, show the error, back off 60 s. |
 | 401 | refresh once; `invalid_grant` → token cleared → `needs_auth`. |
 | 429 | back off for Retry-After. |
 | Network / 5xx | status `error`, retry next tick. |
