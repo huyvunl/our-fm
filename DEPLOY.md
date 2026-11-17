@@ -81,4 +81,12 @@ The next time it plays, Our FM shows the "not connected" banner, and you can rep
 
 To change the passcode, edit `OFFICE_PASSCODE` in Railway. This logs everyone out.
 
+Ten wrong passcodes within 15 minutes from the office network block new logins
+from that network for 15 minutes, because the office shares one public IP.
+Browsers that are already logged in keep working.
+
+If `SPOTIFY_DEVICE_NAME` is set but that device isn't available, Our FM falls back
+to the first device it sees, which could be another device on your account.
+Keep Spotify closed on your other devices during office hours if that matters.
+
 The play history lives in `/data/our-fm.db` on the Railway volume and survives redeploys.
